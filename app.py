@@ -25,6 +25,7 @@ def load_data():
 
     return df
 
+
 df = load_data()
 
 # -----------------------------
@@ -32,7 +33,7 @@ df = load_data()
 # -----------------------------
 st.sidebar.title("⚙️ Filters")
 
-df["camera"] = df["name"].str.extract(r'(Camera\d+)')
+df["camera"] = df["name"].str.extract(r'(Camera\d+)')[0]
 
 folders = st.sidebar.multiselect(
     "Folder",
@@ -49,19 +50,24 @@ cameras = st.sidebar.multiselect(
 df_filtered = df[
     (df["folder"].isin(folders)) &
     (df["camera"].isin(cameras))
-]
+].copy()
+
+# 🔥 FIX: Reset index (CRITICAL)
+df_filtered = df_filtered.reset_index(drop=True)
+
+# Fix Drive URLs
 df_filtered["video_url"] = df_filtered["video_url"].str.extract(r'id=([^&]+)')[0] \
-    .apply(lambda x: f"https://drive.google.com/file/d/{x}/preview")# -----------------------------
+    .apply(lambda x: f"https://drive.google.com/file/d/{x}/preview" if pd.notna(x) else np.nan)
+
+# -----------------------------
 # METRICS
 # -----------------------------
 def compute_metrics(df):
-
     correct, total = 0, 0
     errors = []
     overcount, undercount = 0, 0
 
     for _, row in df.iterrows():
-
         pred = [row.get("belt_1"), row.get("belt_2"), row.get("belt_3")]
         gt   = [row.get("belt_1_manual"), row.get("belt_2_manual"), row.get("belt_3_manual")]
 
@@ -106,7 +112,115 @@ c3.metric("Overcount", int(overcount))
 c4.metric("Undercount", int(undercount))
 
 # -----------------------------
-# 📊 ERROR DISTRIBUTION (NEW)
+# MAIN LAYOUT
+# -----------------------------
+col_left, col_right = st.columns([1, 2])
+
+# -----------------------------
+# 🌳 LEFT: FILE BROWSER
+# -----------------------------
+with col_left:
+    st.subheader("📂 Browser")
+
+    def build_tree(df):
+        tree = {}
+        for idx, row in df.iterrows():
+            folder_path = str(row["folder"]) if pd.notna(row["folder"]) else "root"
+            parts = folder_path.split("/")
+
+            current = tree
+            for part in parts:
+                current = current.setdefault(part, {})
+
+            current.setdefault("_videos", []).append((idx, row["name"]))
+        return tree
+
+    def render_tree(tree):
+        for key, value in tree.items():
+
+            if key == "_videos":
+                for idx, video in value:
+
+                    is_selected = (
+                        "selected_video_idx" in st.session_state and
+                        st.session_state["selected_video_idx"] == idx
+                    )
+
+                    label = f"👉 {video}" if is_selected else f"🎥 {video}"
+
+                    if st.button(label, key=f"tree_{idx}", use_container_width=True):
+                        st.session_state["selected_video_idx"] = idx
+
+                continue
+
+            with st.expander(f"📁 {key}", expanded=False):
+                render_tree(value)
+
+    tree = build_tree(df_filtered)
+    render_tree(tree)
+
+# -----------------------------
+# 🎥 RIGHT: VIDEO INSPECTOR
+# -----------------------------
+with col_right:
+    st.subheader("🎥 Video Inspector")
+
+    video_options = df_filtered["name"].tolist()
+
+    # Initialize selection
+    if "selected_video_idx" not in st.session_state:
+        if len(df_filtered) > 0:
+            st.session_state["selected_video_idx"] = df_filtered.index[0]
+
+    selected_idx = st.session_state.get("selected_video_idx", None)
+
+    if selected_idx is None or selected_idx not in df_filtered.index:
+        st.warning("Select a video from the browser")
+        st.stop()
+
+    video_row = df_filtered.loc[selected_idx]
+
+    col1, col2 = st.columns([2, 1])
+
+    # VIDEO PLAYER
+    with col1:
+        if pd.notna(video_row["video_url"]):
+            st.iframe(video_row["video_url"], height=500)
+        else:
+            st.warning("No video URL available")
+
+    # METRICS PANEL
+    with col2:
+        st.markdown("### 📊 Counts")
+
+        for i in [1, 2, 3]:
+            manual = video_row[f"belt_{i}_manual"]
+            pred = video_row[f"belt_{i}"]
+            err = video_row[f"error_belt_{i}"]
+
+            if pd.notna(manual) and manual > 0:
+                if err == 0:
+                    color = "🟢"
+                elif err > 0:
+                    color = "🔴"
+                else:
+                    color = "🟡"
+
+                st.write(f"{color} **Belt {i}:** {int(pred)} / {int(manual)}")
+
+        st.markdown("### ⚠️ Errors")
+
+        for i in [1, 2, 3]:
+            err = video_row[f"error_belt_{i}"]
+
+            if pd.notna(err) and err != 0:
+                if err > 0:
+                    st.write(f"🔴 B{i} Overcount: +{int(err)}")
+                else:
+                    st.write(f"🟡 B{i} Undercount: {int(err)}")
+
+# -----------------------------
+# 📊 ERROR DISTRIBUTION
 # -----------------------------
 st.subheader("📊 Error Distribution")
 
@@ -118,7 +232,7 @@ else:
     st.info("No errors to display")
 
 # -----------------------------
-# 🔥 WORST CASES (CLICKABLE)
+# 🚨 WORST CASES
 # -----------------------------
 st.subheader("🚨 Worst Videos")
 
@@ -130,6 +244,11 @@ selected_worst = st.selectbox(
     key="worst_selector"
 )
 
+# 🔥 Sync with inspector
+if selected_worst:
+    idx = df_filtered[df_filtered["name"] == selected_worst].index[0]
+    st.session_state["selected_video_idx"] = idx
+
 st.dataframe(
     worst[[
         "name", "total_error",
@@ -139,7 +258,7 @@ st.dataframe(
 )
 
 # -----------------------------
-# CLEAN TABLE
+# 📋 CLEAN TABLE
 # -----------------------------
 st.subheader("📋 Full Results (Only Real Belts)")
 
@@ -167,71 +286,13 @@ def highlight(row):
 st.dataframe(display_df.style.apply(highlight, axis=1), width="stretch")
 
 # -----------------------------
-# 🎥 VIDEO INSPECTOR (AUTO-SYNC)
-# -----------------------------
-st.subheader("🎥 Video Inspector")
-
-# 🔥 Use worst selection as default
-video_options = df_filtered["name"].tolist()
-
-default_index = video_options.index(selected_worst) if selected_worst in video_options else 0
-
-selected_video = st.selectbox(
-    "Select a video",
-    video_options,
-    index=default_index
-)
-
-video_row = df_filtered[df_filtered["name"] == selected_video].iloc[0]
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    if pd.notna(video_row["video_url"]):
-        st.components.v1.iframe(video_row["video_url"], height=500)
-    else:
-        st.warning("No video URL available")
-
-with col2:
-    st.markdown("### 📊 Counts")
-
-    for i in [1, 2, 3]:
-        manual = video_row[f"belt_{i}_manual"]
-        pred = video_row[f"belt_{i}"]
-        err = video_row[f"error_belt_{i}"]
-
-        if pd.notna(manual) and manual > 0:
-
-            # 🎯 COLOR LOGIC
-            if err == 0:
-                color = "🟢"
-            elif err > 0:
-                color = "🔴"  # overcount
-            else:
-                color = "🟡"  # undercount
-
-            st.write(f"{color} **Belt {i}:** {int(pred)} / {int(manual)}")
-
-    st.markdown("### ⚠️ Errors")
-
-    for i in [1, 2, 3]:
-        err = video_row[f"error_belt_{i}"]
-
-        if pd.notna(err) and err != 0:
-            if err > 0:
-                st.write(f"🔴 B{i} Overcount: +{int(err)}")
-            else:
-                st.write(f"🟡 B{i} Undercount: {int(err)}")
-
-
-# -----------------------------
-# 🎯 FRAME-LEVEL DEBUG (NEXT LEVEL)
+# 🎯 FRAME-LEVEL DEBUG
 # -----------------------------
 st.subheader("🎯 Frame-level Error Inspection")
 
 if "frame_error" in df_filtered.columns:
 
-    video_frames = df_filtered[df_filtered["name"] == selected_video]
+    video_frames = df_filtered[df_filtered["name"] == video_row["name"]]
 
     if not video_frames.empty:
 
