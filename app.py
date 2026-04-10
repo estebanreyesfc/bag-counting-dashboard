@@ -50,8 +50,8 @@ df_filtered = df[
     (df["folder"].isin(folders)) &
     (df["camera"].isin(cameras))
 ]
-
-# -----------------------------
+df_filtered["video_url"] = df_filtered["video_url"].str.extract(r'id=([^&]+)')[0] \
+    .apply(lambda x: f"https://drive.google.com/file/d/{x}/preview")# -----------------------------
 # METRICS
 # -----------------------------
 def compute_metrics(df):
@@ -188,7 +188,7 @@ col1, col2 = st.columns([2, 1])
 
 with col1:
     if pd.notna(video_row["video_url"]):
-        st.video(video_row["video_url"])
+        st.components.v1.iframe(video_row["video_url"], height=500)
     else:
         st.warning("No video URL available")
 
