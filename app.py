@@ -52,7 +52,6 @@ df_filtered = df[
     (df["camera"].isin(cameras))
 ].copy()
 
-# 🔥 FIX: Reset index (CRITICAL)
 df_filtered = df_filtered.reset_index(drop=True)
 
 # Fix Drive URLs
@@ -64,8 +63,12 @@ df_filtered["video_url"] = df_filtered["video_url"].str.extract(r'id=([^&]+)')[0
 # -----------------------------
 def compute_metrics(df):
     correct, total = 0, 0
-    errors = []
+    errors, abs_errors = [], []
     overcount, undercount = 0, 0
+    within_1, within_2 = 0, 0
+    big_errors = 0
+
+    all_pred, all_gt = [], []
 
     for _, row in df.iterrows():
         pred = [row.get("belt_1"), row.get("belt_2"), row.get("belt_3")]
@@ -82,10 +85,19 @@ def compute_metrics(df):
         for i in range(min(len(pred), len(gt))):
             diff = pred[i] - gt[i]
 
+            errors.append(diff)
+            abs_errors.append(abs(diff))
+            all_pred.append(pred[i])
+            all_gt.append(gt[i])
+
             if diff == 0:
                 correct += 1
-            else:
-                errors.append(diff)
+            if abs(diff) <= 1:
+                within_1 += 1
+            if abs(diff) <= 2:
+                within_2 += 1
+            if abs(diff) >= 3:
+                big_errors += 1
 
             if diff > 0:
                 overcount += diff
@@ -94,22 +106,64 @@ def compute_metrics(df):
 
             total += 1
 
-    accuracy = correct / total if total else np.nan
-    return accuracy, overcount, undercount, total, errors
+    return {
+        "accuracy": correct / total if total else np.nan,
+        "acc_1": within_1 / total if total else np.nan,
+        "acc_2": within_2 / total if total else np.nan,
+        "mae": np.mean(abs_errors) if abs_errors else np.nan,
+        "bias": (overcount - undercount) / total if total else np.nan,
+        "failure_rate": big_errors / total if total else np.nan,
+        "overcount": overcount,
+        "undercount": undercount,
+        "total": total,
+        "errors": errors,
+        "all_pred": all_pred,
+        "all_gt": all_gt,
+        "correlation": np.corrcoef(all_gt, all_pred)[0, 1] if len(all_gt) > 1 else np.nan
+    }
 
 
-accuracy, overcount, undercount, total, errors = compute_metrics(df_filtered)
+metrics = compute_metrics(df_filtered)
 
 # -----------------------------
 # KPIs
 # -----------------------------
 st.title("📦 Bag Counting — Production Dashboard")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Global Accuracy", f"{accuracy:.2%}" if pd.notna(accuracy) else "N/A")
-c2.metric("Comparisons", total)
-c3.metric("Overcount", int(overcount))
-c4.metric("Undercount", int(undercount))
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+
+c1.metric("Exact", f"{metrics['accuracy']:.1%}")
+c2.metric("±1 Bag", f"{metrics['acc_1']:.1%}")
+c3.metric("±2 Bags", f"{metrics['acc_2']:.1%}")
+c4.metric("MAE", f"{metrics['mae']:.2f}")
+c5.metric("Bias", f"{metrics['bias']:+.2f}")
+c6.metric("Fail ≥3", f"{metrics['failure_rate']:.1%}")
+
+c7, c8, c9 = st.columns(3)
+c7.metric("Comparisons", metrics["total"])
+c8.metric("Overcount", int(metrics["overcount"]))
+c9.metric("Undercount", int(metrics["undercount"]))
+
+# -----------------------------
+# CORRELATION
+# -----------------------------
+st.subheader("🔗 Prediction vs Ground Truth")
+
+if len(metrics["all_gt"]) > 0:
+    corr_df = pd.DataFrame({
+        "Ground Truth": metrics["all_gt"],
+        "Prediction": metrics["all_pred"]
+    })
+
+    fig = px.scatter(
+        corr_df,
+        x="Ground Truth",
+        y="Prediction",
+        trendline="ols",
+        title=f"Correlation: {metrics['correlation']:.3f}"
+    )
+
+    st.plotly_chart(fig, width="stretch")
 
 # -----------------------------
 # MAIN LAYOUT
@@ -117,7 +171,7 @@ c4.metric("Undercount", int(undercount))
 col_left, col_right = st.columns([1, 2])
 
 # -----------------------------
-# 🌳 LEFT: FILE BROWSER
+# FILE BROWSER
 # -----------------------------
 with col_left:
     st.subheader("📂 Browser")
@@ -137,10 +191,8 @@ with col_left:
 
     def render_tree(tree):
         for key, value in tree.items():
-
             if key == "_videos":
                 for idx, video in value:
-
                     is_selected = (
                         "selected_video_idx" in st.session_state and
                         st.session_state["selected_video_idx"] == idx
@@ -148,48 +200,38 @@ with col_left:
 
                     label = f"👉 {video}" if is_selected else f"🎥 {video}"
 
-                    if st.button(label, key=f"tree_{idx}", use_container_width=True):
+                    if st.button(label, key=f"tree_{idx}", width="stretch"):
                         st.session_state["selected_video_idx"] = idx
-
                 continue
 
-            with st.expander(f"📁 {key}", expanded=False):
+            with st.expander(f"📁 {key}"):
                 render_tree(value)
 
-    tree = build_tree(df_filtered)
-    render_tree(tree)
+    render_tree(build_tree(df_filtered))
 
 # -----------------------------
-# 🎥 RIGHT: VIDEO INSPECTOR
+# VIDEO INSPECTOR
 # -----------------------------
 with col_right:
     st.subheader("🎥 Video Inspector")
 
-    video_options = df_filtered["name"].tolist()
+    if "selected_video_idx" not in st.session_state and len(df_filtered) > 0:
+        st.session_state["selected_video_idx"] = df_filtered.index[0]
 
-    # Initialize selection
-    if "selected_video_idx" not in st.session_state:
-        if len(df_filtered) > 0:
-            st.session_state["selected_video_idx"] = df_filtered.index[0]
+    selected_idx = st.session_state.get("selected_video_idx")
 
-    selected_idx = st.session_state.get("selected_video_idx", None)
-
-    if selected_idx is None or selected_idx not in df_filtered.index:
-        st.warning("Select a video from the browser")
+    if selected_idx not in df_filtered.index:
+        st.warning("Select a video")
         st.stop()
 
     video_row = df_filtered.loc[selected_idx]
 
     col1, col2 = st.columns([2, 1])
 
-    # VIDEO PLAYER
     with col1:
         if pd.notna(video_row["video_url"]):
             st.iframe(video_row["video_url"], height=500)
-        else:
-            st.warning("No video URL available")
 
-    # METRICS PANEL
     with col2:
         st.markdown("### 📊 Counts")
 
@@ -199,118 +241,29 @@ with col_right:
             err = video_row[f"error_belt_{i}"]
 
             if pd.notna(manual) and manual > 0:
-                if err == 0:
-                    color = "🟢"
-                elif err > 0:
-                    color = "🔴"
-                else:
-                    color = "🟡"
-
-                st.write(f"{color} **Belt {i}:** {int(pred)} / {int(manual)}")
-
-        st.markdown("### ⚠️ Errors")
-
-        for i in [1, 2, 3]:
-            err = video_row[f"error_belt_{i}"]
-
-            if pd.notna(err) and err != 0:
-                if err > 0:
-                    st.write(f"🔴 B{i} Overcount: +{int(err)}")
-                else:
-                    st.write(f"🟡 B{i} Undercount: {int(err)}")
+                color = "🟢" if err == 0 else "🔴" if err > 0 else "🟡"
+                st.write(f"{color} B{i}: {int(pred)} / {int(manual)}")
 
 # -----------------------------
-# 📊 ERROR DISTRIBUTION
+# ERROR DISTRIBUTION
 # -----------------------------
 st.subheader("📊 Error Distribution")
 
-if errors:
-    err_df = pd.DataFrame({"error": errors})
-    fig = px.histogram(err_df, x="error", nbins=30)
+if metrics["errors"]:
+    fig = px.histogram(pd.DataFrame({"error": metrics["errors"]}), x="error")
     st.plotly_chart(fig, width="stretch")
-else:
-    st.info("No errors to display")
 
 # -----------------------------
-# 🚨 WORST CASES
+# WORST CASES
 # -----------------------------
 st.subheader("🚨 Worst Videos")
 
 worst = df_filtered.sort_values("total_error", ascending=False).head(10)
 
-selected_worst = st.selectbox(
-    "Select worst video (auto loads below 👇)",
-    worst["name"],
-    key="worst_selector"
-)
+selected_worst = st.selectbox("Select worst", worst["name"])
 
-# 🔥 Sync with inspector
 if selected_worst:
     idx = df_filtered[df_filtered["name"] == selected_worst].index[0]
     st.session_state["selected_video_idx"] = idx
 
-st.dataframe(
-    worst[[
-        "name", "total_error",
-        "error_belt_1", "error_belt_2", "error_belt_3"
-    ]],
-    width="stretch"
-)
-
-# -----------------------------
-# 📋 CLEAN TABLE
-# -----------------------------
-st.subheader("📋 Full Results (Only Real Belts)")
-
-display_df = df_filtered.copy()
-
-belt_cols = [
-    "belt_1", "belt_2", "belt_3",
-    "belt_1_manual", "belt_2_manual", "belt_3_manual"
-]
-
-for i in [1, 2, 3]:
-    mask = display_df[f"belt_{i}_manual"].isna()
-    display_df.loc[mask, [f"belt_{i}", f"belt_{i}_manual"]] = np.nan
-
-for col in belt_cols:
-    display_df[col] = display_df[col].replace(0, np.nan)
-
-display_df = display_df.dropna(subset=belt_cols, how="all")
-
-def highlight(row):
-    if row["total_error"] > 5:
-        return ["background-color: #5c1a1a"] * len(row)
-    return [""] * len(row)
-
-st.dataframe(display_df.style.apply(highlight, axis=1), width="stretch")
-
-# -----------------------------
-# 🎯 FRAME-LEVEL DEBUG
-# -----------------------------
-st.subheader("🎯 Frame-level Error Inspection")
-
-if "frame_error" in df_filtered.columns:
-
-    video_frames = df_filtered[df_filtered["name"] == video_row["name"]]
-
-    if not video_frames.empty:
-
-        fig = px.line(
-            video_frames,
-            x="frame",
-            y="frame_error",
-            title="Error over time"
-        )
-
-        st.plotly_chart(fig, width="stretch")
-
-        worst_frame = video_frames.loc[
-            video_frames["frame_error"].idxmax()
-        ]
-
-        st.metric("Worst Frame Error", worst_frame["frame_error"])
-        st.write(f"Frame: {int(worst_frame['frame'])}")
-
-else:
-    st.info("Frame-level data not available")
+st.dataframe(worst[["name", "total_error"]], width="stretch")
